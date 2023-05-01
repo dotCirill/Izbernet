@@ -2,10 +2,12 @@ package izbernet
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -112,6 +114,65 @@ func decryptRSA(priv *rsa.PrivateKey, data []byte) []byte {
 	return decryptedData
 }
 
+func dataHash(data []byte) ([]byte, error) {
+	msgHash := sha512.New()
+	_, err := msgHash.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	msgHashSum := msgHash.Sum(nil)
+	return msgHashSum, nil
+}
+
+func sign(priv *rsa.PrivateKey, data []byte) ([]byte, error) {
+	msgHashSum, _ := dataHash(data)
+	signature, err := rsa.SignPSS(rand.Reader, priv, crypto.SHA512, msgHashSum, nil)
+	if err != nil {
+		return nil, err
+	}
+	return signature, nil
+}
+
+func verify(pub *rsa.PublicKey, sign []byte, data []byte) error {
+	msgHashSum, _ := dataHash(data)
+	err := rsa.VerifyPSS(pub, crypto.SHA512, msgHashSum, sign, nil)
+	return err
+}
+
+const SIGNATURE_SIZE_BYTES = 256
+
+func deleteSignature(data []byte) []byte {
+	return data[:len(data)-SIGNATURE_SIZE_BYTES]
+}
+
+func (v *VoterActor) signBulletins(bulletins BulletinList) error {
+	for i := 0; i < len(v.votersChain); i++ {
+		signature, err := sign(v.privateKey, bulletins[i])
+		if err != nil {
+			return err
+		}
+		bulletins[i] = append(bulletins[i], signature...)
+	}
+	return nil
+}
+
+func (v *VoterActor) verifyBulletins(bulletins BulletinList, publicKey *rsa.PublicKey) error {
+	for i := 0; i < len(v.votersChain); i++ {
+		signature := bulletins[i][len(bulletins[i])-SIGNATURE_SIZE_BYTES:]
+		b := bulletins[i][:len(bulletins[i])-SIGNATURE_SIZE_BYTES]
+		//fmt.Printf("bull: %v, sign: %v, hash: %v\n", len(bulletins[i]), len(sign), len(msgHashSum))
+		err := verify(publicKey, signature, b)
+		if err != nil {
+			fmt.Printf("incorrect signature %v\n", len(signature))
+			return nil
+		} else {
+			//print("signature verified\n")
+			//bulletins[i] = deleteSignature(bulletins[i])
+		}
+	}
+	return nil
+}
+
 func (v *VoterActor) createBulletin(data []byte) (Bulletin, error) {
 	y := data
 	randomBytes, err := getBulletinRandom()
@@ -135,7 +196,7 @@ func (v *VoterActor) createBulletin(data []byte) (Bulletin, error) {
 		}
 
 	}
-
+	// E_0(E_1(E_2(x||r_i))) ???
 	for i := len(v.votersChain) - 1; i >= 0; i-- {
 		// Encrypt with random
 		randomBytes, err := getBulletinRandom()
@@ -165,7 +226,6 @@ func (v *VoterActor) decryptBulletins1(bulletins BulletinList) error {
 
 		if !foundMyBulletin {
 			bRand := b[len(b)-BULLETIN_RANDOM_SIZE:]
-
 			for j := 0; j < len(v.randoms); j++ {
 				if bytes.Equal(bRand, v.randoms[j]) {
 					foundMyBulletin = true
@@ -198,7 +258,7 @@ func (v *VoterActor) getBulletins1() (BulletinList, error) {
 	bulletins := make(BulletinList, len(v.votersChain))
 
 	if v.selfIndexInChain == 0 {
-		// get 1 bulletin from each users
+		// get 1 bulletin from each user
 		bulletinsCount := 0
 		for bulletinsCount < len(v.votersChain) {
 			bl, voter := v.recv()
@@ -247,7 +307,6 @@ func (v *VoterActor) decryptBulletins2(bulletins BulletinList) error {
 		b := decryptRSA(v.privateKey, bulletins[i])
 		bulletins[i] = b
 	}
-
 	return nil
 }
 
@@ -316,11 +375,26 @@ func (v *VoterActor) Vote(data []byte) error {
 		return err
 	}
 
-	// Decrypt bulletins first time (and checks)
+	// verifying signature from previous voter
+	// first voter only signing
+	if v.selfIndexInChain != 0 {
+		publicKey := v.votersChain[v.selfIndexInChain-1].PublicKey
+		err = v.verifyBulletins(bulletins, &publicKey)
+		for i := 0; i < len(v.votersChain); i++ {
+			bulletins[i] = deleteSignature(bulletins[i])
+		}
+	}
+
+	// Decrypt bulletins second time (and checks)
+	fmt.Printf("%v decrypting2\n", v.selfIndexInChain)
 	err = v.decryptBulletins2(bulletins)
 	if err != nil {
 		return err
 	}
+
+	//signing decrypted bulletins
+	fmt.Printf("%v signing\n", v.selfIndexInChain)
+	err = v.signBulletins(bulletins)
 
 	if v.selfIndexInChain != len(v.votersChain)-1 {
 		v.sendBulletinsNextVoter(bulletins)
@@ -334,6 +408,14 @@ func (v *VoterActor) Vote(data []byte) error {
 			v.send(bulletins, i)
 		}
 	}
+	//check bull signs received from last voter
+	publicKey := v.votersChain[len(v.votersChain)-1].PublicKey
+	err = v.verifyBulletins(bulletins, &publicKey)
+	if err != nil {
+		return err
+	}
+	//delete sign of last voter
+	bulletins[v.selfIndexInChain] = deleteSignature(bulletins[v.selfIndexInChain])
 
 	fmt.Printf("%v RESULT %v\n", v.selfIndexInChain, bulletins)
 	return nil
